@@ -10,6 +10,17 @@ import plotly.graph_objects as go
 from pathlib import Path
 from quant_lite import run_one, Config
 
+# Cached function (must be defined before use)
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_forecast_cached(ticker: str, horizon_months: int, default_suffix: str):
+    """Cached wrapper around run_one to avoid re-training models."""
+    cfg = Config(
+        horizon_months=horizon_months,
+        default_suffix=default_suffix,
+        cache_dir=Path("data_cache"),
+    )
+    return run_one(ticker, cfg=cfg, refresh=False)
+
 # Page config
 st.set_page_config(
     page_title="StockForecast AI | Indian Stock Predictions",
@@ -330,14 +341,3 @@ st.markdown("""
     <p>© 2024 StockForecast AI | Not affiliated with any financial institution</p>
 </div>
 """, unsafe_allow_html=True)
-
-# Cached function
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_forecast_cached(ticker: str, horizon_months: int, default_suffix: str):
-    """Cached wrapper around run_one to avoid re-training models."""
-    cfg = Config(
-        horizon_months=horizon_months,
-        default_suffix=default_suffix,
-        cache_dir=Path("data_cache"),
-    )
-    return run_one(ticker, cfg=cfg, refresh=False)
