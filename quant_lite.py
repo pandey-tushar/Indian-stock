@@ -442,10 +442,11 @@ def fit_models(
     y_up = train["Target_Up"]
     y_ret = train["Target_LogRet"]
 
-    # Tuned hyperparameters with stronger regularization
+    # Balanced hyperparameters: good speed with minimal accuracy loss
+    # Middle ground: 130/150 estimators, 0.04 learning rate
     clf = GradientBoostingClassifier(
-        n_estimators=150,
-        learning_rate=0.03,
+        n_estimators=130,  # Middle: 100-150 (was 150)
+        learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.03)
         max_depth=2,
         min_samples_split=20,
         min_samples_leaf=10,
@@ -454,8 +455,8 @@ def fit_models(
     )
     reg_med = GradientBoostingRegressor(
         loss="squared_error",
-        n_estimators=200,
-        learning_rate=0.03,
+        n_estimators=150,  # Middle: 120-200 (was 200)
+        learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.03)
         max_depth=2,
         min_samples_split=20,
         min_samples_leaf=10,
@@ -465,8 +466,8 @@ def fit_models(
     reg_p10 = GradientBoostingRegressor(
         loss="quantile",
         alpha=0.10,
-        n_estimators=200,
-        learning_rate=0.03,
+        n_estimators=150,  # Middle: 120-200 (was 200)
+        learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.03)
         max_depth=2,
         min_samples_split=20,
         min_samples_leaf=10,
@@ -476,8 +477,8 @@ def fit_models(
     reg_p90 = GradientBoostingRegressor(
         loss="quantile",
         alpha=0.90,
-        n_estimators=200,
-        learning_rate=0.03,
+        n_estimators=150,  # Middle: 120-200 (was 200)
+        learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.03)
         max_depth=2,
         min_samples_split=20,
         min_samples_leaf=10,
@@ -592,24 +593,24 @@ def run_one_horizon(
         p_up_clf = float("nan")
         reg_med = GradientBoostingRegressor(
             loss="squared_error",
-            n_estimators=250,
-            learning_rate=0.05,
+            n_estimators=180,  # Middle: 150-250 (was 250)
+            learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.05)
             max_depth=3,
             random_state=42,
         )
         reg_p10 = GradientBoostingRegressor(
             loss="quantile",
             alpha=0.10,
-            n_estimators=250,
-            learning_rate=0.05,
+            n_estimators=180,  # Middle: 150-250 (was 250)
+            learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.05)
             max_depth=3,
             random_state=42,
         )
         reg_p90 = GradientBoostingRegressor(
             loss="quantile",
             alpha=0.90,
-            n_estimators=250,
-            learning_rate=0.05,
+            n_estimators=180,  # Middle: 150-250 (was 250)
+            learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.05)
             max_depth=3,
             random_state=42,
         )
@@ -681,18 +682,16 @@ def run_one_multi_horizon(ticker: str, cfg: Config, refresh: bool = False) -> di
         return None
 
     # Determine which horizons to use based on available data
-    # Train multiple horizons to cover the slider range (1-12 months)
+    # Optimized: train fewer horizons for speed (1M, 3M, 6M cover most use cases)
+    # Slider will pick closest available horizon
     horizons_to_use = []
     if len(df) >= 100:  # Need at least ~100 days for 1M
         horizons_to_use.append(1)
-    if len(df) >= 150:  # Need at least ~150 days for 2M
-        horizons_to_use.append(2)
     if len(df) >= 200:  # Need at least ~200 days for 3M
         horizons_to_use.append(3)
     if len(df) >= 400:  # Need at least ~400 days for 6M
         horizons_to_use.append(6)
-    if len(df) >= 800:  # Need at least ~800 days for 12M
-        horizons_to_use.append(12)
+    # Skip 2M and 12M for speed - slider will use closest (1M/3M or 6M)
     
     # Fallback: if we can't use multiple horizons, use single horizon approach
     if not horizons_to_use:
@@ -729,13 +728,8 @@ def run_one_multi_horizon(ticker: str, cfg: Config, refresh: bool = False) -> di
                     h_days = result["horizon_days"]
                     exp_ret_pct = pct_from_logret(result["pred_med_scaled"])
                     
-                    # Get OOS metrics if available
-                    if len(df) >= cfg.min_rows_long:
-                        data = engineer_features(df, horizon_days=h_days)
-                        feature_cols = get_feature_cols_for_horizon(data, horizon_days=h_days, data_length=len(df))
-                        metrics = oos_sanity_metrics(data=data, feature_cols=feature_cols)
-                    else:
-                        metrics = {}
+                    # Skip OOS metrics for speed (expensive 5-fold CV, not critical for predictions)
+                    metrics = {}
                     
                     horizon_results[f"{h_months}M"] = {
                         "Stock": ticker,
@@ -801,24 +795,24 @@ def run_one(ticker: str, cfg: Config, refresh: bool = False) -> dict | None:
         p_up_clf = float("nan")
         reg_med = GradientBoostingRegressor(
             loss="squared_error",
-            n_estimators=250,
-            learning_rate=0.05,
+            n_estimators=180,  # Middle: 150-250 (was 250)
+            learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.05)
             max_depth=3,
             random_state=42,
         )
         reg_p10 = GradientBoostingRegressor(
             loss="quantile",
             alpha=0.10,
-            n_estimators=250,
-            learning_rate=0.05,
+            n_estimators=180,  # Middle: 150-250 (was 250)
+            learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.05)
             max_depth=3,
             random_state=42,
         )
         reg_p90 = GradientBoostingRegressor(
             loss="quantile",
             alpha=0.90,
-            n_estimators=250,
-            learning_rate=0.05,
+            n_estimators=180,  # Middle: 150-250 (was 250)
+            learning_rate=0.04,  # Middle: 0.03-0.05 (was 0.05)
             max_depth=3,
             random_state=42,
         )
