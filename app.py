@@ -15,13 +15,23 @@ from quant_lite import Config, run_one
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_forecast_cached(ticker: str, horizon_months: int, default_suffix: str) -> dict | None:
+def get_forecast_cached(ticker: str, horizon_months: int, default_suffix: str, use_multi_horizon: bool = True) -> dict | None:
     """
-    Cached wrapper around run_one to avoid retraining on repeat queries.
-    Cache key includes (ticker, horizon_months, default_suffix).
+    Cached wrapper around run_one/run_one_multi_horizon to avoid retraining on repeat queries.
+    Cache key includes (ticker, horizon_months, default_suffix, use_multi_horizon).
     """
-    cfg = Config(horizon_months=horizon_months, default_suffix=default_suffix, cache_dir=Path("data_cache"))
-    return run_one(ticker, cfg=cfg, refresh=False)
+    from quant_lite import run_one_multi_horizon
+    
+    cfg = Config(
+        horizon_months=horizon_months,
+        default_suffix=default_suffix,
+        cache_dir=Path("data_cache"),
+        use_multi_horizon=use_multi_horizon,
+    )
+    if use_multi_horizon:
+        return run_one_multi_horizon(ticker, cfg=cfg, refresh=False)
+    else:
+        return run_one(ticker, cfg=cfg, refresh=False)
 
 
 st.set_page_config(
@@ -63,6 +73,7 @@ with st.sidebar:
     st.markdown("---")
     default_suffix = st.selectbox("Default exchange", [".NS (NSE)", ".BO (BSE)"], index=0).split()[0]
     fallback_suffix = st.text_input("Fallback exchange", ".BO")
+    use_multi_horizon = st.checkbox("Multi-horizon ensemble (1M/3M/6M)", value=True, help="Ensemble predictions from multiple horizons for better accuracy")
     st.markdown("---")
     st.caption("Not financial advice.")
 
@@ -92,7 +103,7 @@ with tab_forecast:
             raw = ticker_input.strip().upper()
             ticker = raw if raw.endswith((".NS", ".BO")) else f"{raw}{default_suffix}"
 
-            result = get_forecast_cached(ticker, horizon_months, default_suffix)
+            result = get_forecast_cached(ticker, horizon_months, default_suffix, use_multi_horizon=use_multi_horizon)
 
             # Fallback if primary fails
             if result is None and fallback_suffix:
@@ -101,7 +112,7 @@ with tab_forecast:
                 else:
                     base = raw
                 alt = f"{base}{fallback_suffix}"
-                result = get_forecast_cached(alt, horizon_months, default_suffix="")
+                result = get_forecast_cached(alt, horizon_months, default_suffix="", use_multi_horizon=use_multi_horizon)
                 if result is not None:
                     ticker = alt
 
@@ -159,20 +170,31 @@ with tab_forecast:
             st.plotly_chart(fig, use_container_width=True)
 
             with st.expander("Details"):
-                st.write(
-                    {
-                        "Price": result.get("Price"),
-                        "Model_Regime": result.get("Model_Regime"),
-                        "Data_Rows": result.get("Data_Rows"),
-                        "Uncertainty_Band_%": result.get("Uncertainty_Band_%"),
-                    }
-                )
+                details = {
+                    "Price": result.get("Price"),
+                    "Model_Regime": result.get("Model_Regime"),
+                    "Data_Rows": result.get("Data_Rows"),
+                    "Uncertainty_Band_%": result.get("Uncertainty_Band_%"),
+                }
+                if "Ensemble_Horizons" in result:
+                    details["Ensemble_Horizons"] = result.get("Ensemble_Horizons")
+                st.write(details)
 
 with tab_about:
     st.markdown("### About the model")
     st.markdown(
         """
 This app predicts forward returns using **Gradient Boosting** on stationary technical features (returns/ratios, not raw prices).
+
+**Multi-horizon ensemble mode** (default):
+- Trains separate models for 1M, 3M, and 6M horizons
+- Ensembles predictions with confidence weighting
+- Better captures different time-scale dynamics
+- Reduces overfitting by not forcing one model to fit all horizons
+
+**Single-horizon mode**:
+- Trains one model for the selected horizon
+- Faster but may be less robust
 
 It outputs:
 - **Median forecast** plus **P10/P90 bands** (uncertainty)
