@@ -9,6 +9,7 @@ ENV/
 
 ## Data / outputs
 data_cache/
+model_cache/
 results*.csv
 
 ## OS / tooling

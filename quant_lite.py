@@ -17,8 +17,11 @@ Design choices:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
+import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -212,6 +215,7 @@ class Config:
     cache_max_age_hours: int = 24
     model_cache_dir: Path = Path("model_cache")
     model_cache_max_age_hours: int = 24  # Re-train if model is older than this
+    use_multi_horizon: bool = True  # Use multi-horizon ensemble by default
 
     @property
     def horizon_days(self) -> int:
@@ -266,16 +270,126 @@ def load_cached_or_download(
         return None
 
 
+def get_feature_cols_for_horizon(df: pd.DataFrame, horizon_days: int, data_length: int) -> list[str]:
+    """
+    Get horizon-appropriate feature columns based on data length and horizon.
+    Shorter horizons use shorter-window features; longer horizons use longer-window features.
+    Only returns features that actually exist in the dataframe.
+    """
+    # Base features that are always available
+    base_features = ["RSI_14", "MACD_Norm", "ATR_Norm", "LogRet_1", "LogRet_5", "LogRet_21"]
+    
+    if data_length >= 500:  # Full history
+        if horizon_days <= 21:  # 1M: focus on short-term momentum
+            candidates = [
+                "Dist_SMA20",
+                "Dist_SMA50",
+                "RSI_14",
+                "MACD_Norm",
+                "ATR_Norm",
+                "LogRet_1",
+                "LogRet_5",
+                "Vol_20",
+                "ROC_21",
+                "Mom_Ratio",
+                "Vol_Ratio_Price",
+            ]
+        elif horizon_days <= 63:  # 3M: balanced
+            candidates = [
+                "Dist_SMA50",
+                "Dist_SMA200",
+                "RSI_14",
+                "MACD_Norm",
+                "ATR_Norm",
+                "LogRet_5",
+                "LogRet_21",
+                "Vol_Ratio",
+                "ROC_21",
+                "Mom_Ratio",
+                "Vol_Ratio_Price",
+            ]
+        else:  # 6M+: focus on longer-term trends
+            candidates = [
+                "Dist_SMA50",
+                "Dist_SMA200",
+                "RSI_14",
+                "MACD_Norm",
+                "ATR_Norm",
+                "LogRet_21",
+                "Vol_Ratio",
+                "ROC_21",
+                "Mom_Ratio",
+                "Vol_Ratio_Price",
+            ]
+    elif data_length >= 180:  # Medium history
+        if horizon_days <= 21:
+            candidates = [
+                "Dist_SMA20",
+                "Dist_SMA50",
+                "RSI_14",
+                "MACD_Norm",
+                "ATR_Norm",
+                "LogRet_5",
+                "Vol_20",
+                "ROC_21",
+                "Mom_Ratio",
+                "Vol_Ratio_Price",
+            ]
+        else:
+            candidates = [
+                "Dist_SMA50",
+                "RSI_14",
+                "MACD_Norm",
+                "ATR_Norm",
+                "LogRet_5",
+                "LogRet_21",
+                "Vol_Ratio",
+                "ROC_21",
+                "Mom_Ratio",
+                "Vol_Ratio_Price",
+            ]
+    else:  # Short history
+        candidates = [
+            "Dist_SMA20",
+            "RSI_14",
+            "MACD_Norm",
+            "ATR_Norm",
+            "LogRet_5",
+            "Vol_20",
+            "ROC_21",
+        ]
+    
+    # Filter to only include features that exist in the dataframe
+    available = [f for f in candidates if f in df.columns]
+    return available if available else base_features
+
+
 def engineer_features(df: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
     """
     Build stationary features and target.
     - Features are computed for all dates where indicators exist.
     - Target exists only where future close exists (shift(-horizon_days)).
+    - Feature windows are adapted based on horizon_days for better horizon-specific modeling.
     """
     x = df.copy()
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         if col not in x.columns:
             raise ValueError(f"Missing column: {col}")
+
+    # Adaptive window sizes based on horizon
+    # For shorter horizons, use shorter windows; for longer, use longer windows
+    if horizon_days <= 21:  # 1 month or less
+        sma_short, sma_med, sma_long = 10, 20, 50
+        ret_short, ret_med, ret_long = 1, 5, 10
+        vol_window = 10
+    elif horizon_days <= 63:  # 3 months or less
+        sma_short, sma_med, sma_long = 20, 50, 200
+        ret_short, ret_med, ret_long = 1, 5, 21
+        vol_window = 20
+    else:  # 6+ months
+        sma_short, sma_med, sma_long = 50, 100, 200
+        ret_short, ret_med, ret_long = 5, 21, 63
+        vol_window = 40
 
     x["SMA_50"] = x["Close"].rolling(50, min_periods=50).mean()
     x["SMA_20"] = x["Close"].rolling(20, min_periods=20).mean()
@@ -294,8 +408,14 @@ def engineer_features(df: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
     x["LogRet_1"] = log_return(x["Close"], periods=1)
     x["LogRet_5"] = log_return(x["Close"], periods=5)
     x["LogRet_21"] = log_return(x["Close"], periods=21)
+    
+    # Horizon-adaptive returns
+    x[f"LogRet_{ret_short}"] = log_return(x["Close"], periods=ret_short)
+    x[f"LogRet_{ret_med}"] = log_return(x["Close"], periods=ret_med)
+    if ret_long != ret_med:
+        x[f"LogRet_{ret_long}"] = log_return(x["Close"], periods=ret_long)
 
-    x["Vol_20"] = realized_vol(x["LogRet_1"], window=20)
+    x["Vol_20"] = realized_vol(x["LogRet_1"], window=vol_window)
     x["Vol_H"] = realized_vol(x["LogRet_1"], window=horizon_days)
     x["Vol_Ratio"] = x["Vol_20"] / (x["Vol_H"] + EPS)
     
@@ -436,6 +556,230 @@ def pct_from_logret(x: float) -> float:
     return (math.exp(x) - 1.0) * 100.0
 
 
+def run_one_horizon(
+    ticker: str,
+    df: pd.DataFrame,
+    horizon_months: int,
+    cfg: Config,
+    refresh: bool = False,
+) -> dict | None:
+    """
+    Run prediction for a single horizon. Internal function used by multi-horizon ensemble.
+    """
+    horizon_days = horizon_months * cfg.trading_days_per_month
+    
+    # For short histories, fall back to a shorter horizon
+    horizon_used = horizon_days
+    if len(df) < cfg.min_rows_long:
+        horizon_used = int(min(horizon_days, max(5, len(df) // 6)))
+
+    data = engineer_features(df, horizon_days=horizon_used)
+    feature_cols = get_feature_cols_for_horizon(data, horizon_days=horizon_used, data_length=len(df))
+
+    # training rows must have both features and target
+    train = data.dropna(subset=feature_cols + ["Target_LogRet", "Target_Up"])
+    if len(train) < (80 if len(df) >= cfg.min_rows_long else 40):
+        return None
+
+    # latest row: features must exist; target may not.
+    latest = data.dropna(subset=feature_cols).iloc[[-1]]
+
+    # Fit models
+    if len(df) >= cfg.min_rows_long:
+        clf, reg_med, reg_p10, reg_p90, feat_imp = fit_models(train=train, feature_cols=feature_cols)
+        p_up_clf = float(clf.predict_proba(latest[feature_cols])[:, 1][0])
+    else:
+        p_up_clf = float("nan")
+        reg_med = GradientBoostingRegressor(
+            loss="squared_error",
+            n_estimators=250,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=42,
+        )
+        reg_p10 = GradientBoostingRegressor(
+            loss="quantile",
+            alpha=0.10,
+            n_estimators=250,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=42,
+        )
+        reg_p90 = GradientBoostingRegressor(
+            loss="quantile",
+            alpha=0.90,
+            n_estimators=250,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=42,
+        )
+        X = train[feature_cols]
+        y = train["Target_LogRet"]
+        reg_med.fit(X, y)
+        reg_p10.fit(X, y)
+        reg_p90.fit(X, y)
+
+    pred_med = float(reg_med.predict(latest[feature_cols])[0])
+    pred_p10 = float(reg_p10.predict(latest[feature_cols])[0])
+    pred_p90 = float(reg_p90.predict(latest[feature_cols])[0])
+
+    # Scale back to target horizon if we trained on a shorter horizon.
+    scale = float(horizon_days) / float(horizon_used)
+    pred_med_scaled = pred_med * scale
+    pred_p10_scaled = pred_p10 * scale
+    pred_p90_scaled = pred_p90 * scale
+
+    # Implied probability from forecast distribution
+    iq = max(EPS, (pred_p90_scaled - pred_p10_scaled))
+    sigma = iq / 2.5631031310892007
+    p_up_imp = normal_cdf(pred_med_scaled / max(EPS, sigma))
+
+    if not np.isnan(p_up_clf):
+        p_up = float(np.clip(0.7 * p_up_clf + 0.3 * p_up_imp, 0.0, 1.0))
+        model_regime = "full"
+    else:
+        p_up = float(np.clip(p_up_imp, 0.0, 1.0))
+        model_regime = "short_history"
+
+    # Realized risk
+    if "Vol_H" in latest.columns and pd.notna(latest["Vol_H"].iloc[0]):
+        vol_used = float(latest["Vol_H"].iloc[0])
+        vol_target = vol_used * math.sqrt(scale)
+        vol_h = float(vol_target * 100.0)
+    else:
+        vol_h = float("nan")
+
+    # Uncertainty proxy
+    band_width = pct_from_logret(pred_p90_scaled) - pct_from_logret(pred_p10_scaled)
+    
+    # Confidence score: inverse of uncertainty band (wider band = less confidence)
+    confidence = 1.0 / (1.0 + band_width / 100.0) if band_width > 0 else 0.5
+
+    return {
+        "horizon_months": horizon_months,
+        "horizon_days": horizon_days,
+        "horizon_days_used": int(horizon_used),
+        "model_regime": model_regime,
+        "p_up": p_up,
+        "pred_med_scaled": pred_med_scaled,
+        "pred_p10_scaled": pred_p10_scaled,
+        "pred_p90_scaled": pred_p90_scaled,
+        "vol_h": vol_h,
+        "band_width": band_width,
+        "confidence": confidence,
+    }
+
+
+def run_one_multi_horizon(ticker: str, cfg: Config, refresh: bool = False) -> dict | None:
+    """
+    Multi-horizon ensemble: train separate models for 1M, 3M, 6M and ensemble predictions.
+    Uses confidence-weighted averaging where confidence = 1 / (1 + uncertainty_band).
+    Trains models in parallel for speed since they all use the same data.
+    """
+    df = load_cached_or_download(ticker, cfg=cfg, refresh=refresh, period="max")
+    if df is None or len(df) < cfg.min_rows_short:
+        return None
+
+    # Determine which horizons to use based on available data
+    horizons_to_use = []
+    if len(df) >= 100:  # Need at least ~100 days for 1M
+        horizons_to_use.append(1)
+    if len(df) >= 200:  # Need at least ~200 days for 3M
+        horizons_to_use.append(3)
+    if len(df) >= 400:  # Need at least ~400 days for 6M
+        horizons_to_use.append(6)
+    
+    # Fallback: if we can't use multiple horizons, use single horizon approach
+    if not horizons_to_use:
+        return None
+    
+    # If only one horizon is available, fall back to single-horizon mode
+    if len(horizons_to_use) == 1:
+        return run_one(ticker, cfg, refresh)
+    
+    # Train models in parallel since they all use the same dataframe
+    horizon_results = []
+    with ThreadPoolExecutor(max_workers=min(len(horizons_to_use), 3)) as executor:
+        # Submit all horizon training tasks
+        future_to_horizon = {
+            executor.submit(run_one_horizon, ticker, df, h_months, cfg, refresh): h_months
+            for h_months in horizons_to_use
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_horizon):
+            h_months = future_to_horizon[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    horizon_results.append(result)
+            except Exception:
+                # If one horizon fails, continue with others
+                # The ensemble will work with whatever horizons succeeded
+                continue
+    
+    if not horizon_results:
+        return None
+    
+    # Ensemble: confidence-weighted average
+    # Weight by confidence (inverse of uncertainty band width)
+    total_weight = sum(r["confidence"] for r in horizon_results)
+    if total_weight <= EPS:
+        # Fallback to equal weights
+        weights = [1.0 / len(horizon_results)] * len(horizon_results)
+    else:
+        weights = [r["confidence"] / total_weight for r in horizon_results]
+    
+    # Weighted average of predictions
+    ens_pred_med = sum(r["pred_med_scaled"] * w for r, w in zip(horizon_results, weights))
+    ens_pred_p10 = sum(r["pred_p10_scaled"] * w for r, w in zip(horizon_results, weights))
+    ens_pred_p90 = sum(r["pred_p90_scaled"] * w for r, w in zip(horizon_results, weights))
+    ens_p_up = sum(r["p_up"] * w for r, w in zip(horizon_results, weights))
+    
+    # For risk, use the longest horizon's vol (most stable)
+    longest_horizon_result = max(horizon_results, key=lambda x: x["horizon_days"])
+    ens_vol_h = longest_horizon_result["vol_h"]
+    
+    # Ensemble uncertainty band
+    ens_band_width = pct_from_logret(ens_pred_p90) - pct_from_logret(ens_pred_p10)
+    
+    # Use the primary horizon (from cfg) for final output
+    primary_horizon_days = cfg.horizon_days
+    
+    # Risk-aware edge and score
+    exp_ret_pct = pct_from_logret(ens_pred_med)
+    signed_prob_edge = (2.0 * ens_p_up - 1.0)
+    edge_pct = exp_ret_pct * signed_prob_edge
+    score = edge_pct / (ens_vol_h + EPS)
+    
+    # Get OOS metrics from the longest horizon model (most reliable)
+    if len(df) >= cfg.min_rows_long:
+        data = engineer_features(df, horizon_days=longest_horizon_result["horizon_days"])
+        feature_cols = get_feature_cols_for_horizon(data, horizon_days=longest_horizon_result["horizon_days"], data_length=len(df))
+        metrics = oos_sanity_metrics(data=data, feature_cols=feature_cols)
+    else:
+        metrics = {}
+    
+    return {
+        "Stock": ticker,
+        "Price": float(df["Close"].iloc[-1]),
+        "Horizon_Days": primary_horizon_days,
+        "Horizon_Days_Used": int(longest_horizon_result["horizon_days_used"]),
+        "Model_Regime": "multi_horizon_ensemble",
+        "Data_Rows": int(len(df)),
+        "P_Up": ens_p_up,
+        "Forecast_Med_%": exp_ret_pct,
+        "Forecast_P10_%": pct_from_logret(ens_pred_p10),
+        "Forecast_P90_%": pct_from_logret(ens_pred_p90),
+        "Uncertainty_Band_%": float(ens_band_width),
+        "Risk_Vol_%": ens_vol_h,
+        "Edge_%": float(edge_pct),
+        "Risk_Adj_Score": float(score),
+        "Ensemble_Horizons": ",".join(str(r["horizon_months"]) for r in horizon_results),
+        **metrics,
+    }
+
+
 def run_one(ticker: str, cfg: Config, refresh: bool = False) -> dict | None:
     df = load_cached_or_download(ticker, cfg=cfg, refresh=refresh, period="max")
     if df is None or len(df) < cfg.min_rows_short:
@@ -451,43 +795,7 @@ def run_one(ticker: str, cfg: Config, refresh: bool = False) -> dict | None:
 
     data = engineer_features(df, horizon_days=horizon_used)
     # Adaptive feature set: avoid long-window indicators for very short histories.
-    if len(df) >= cfg.min_rows_long:
-        feature_cols = [
-            "Dist_SMA50",
-            "Dist_SMA200",
-            "RSI_14",
-            "MACD_Norm",
-            "ATR_Norm",
-            "LogRet_5",
-            "LogRet_21",
-            "Vol_Ratio",
-            "ROC_21",
-            "Mom_Ratio",
-            "Vol_Ratio_Price",
-        ]
-    elif len(df) >= 180:
-        feature_cols = [
-            "Dist_SMA50",
-            "RSI_14",
-            "MACD_Norm",
-            "ATR_Norm",
-            "LogRet_5",
-            "LogRet_21",
-            "Vol_Ratio",
-            "ROC_21",
-            "Mom_Ratio",
-            "Vol_Ratio_Price",
-        ]
-    else:
-        feature_cols = [
-            "Dist_SMA20",
-            "RSI_14",
-            "MACD_Norm",
-            "ATR_Norm",
-            "LogRet_5",
-            "Vol_20",
-            "ROC_21",
-        ]
+    feature_cols = get_feature_cols_for_horizon(data, horizon_days=horizon_used, data_length=len(df))
 
     # training rows must have both features and target
     train = data.dropna(subset=feature_cols + ["Target_LogRet", "Target_Up"])
@@ -609,6 +917,7 @@ def run_one_with_fallback(
     Attempt download/forecast for multiple symbol variants, returning the first success.
     - If raw_ticker has no suffix: tries primary cfg.default_suffix then fallback_suffixes.
     - If raw_ticker ends with cfg.default_suffix and fails: also tries base + each fallback suffix.
+    - Uses multi-horizon ensemble if enabled in cfg.
     """
     attempts: list[str] = []
 
@@ -623,7 +932,11 @@ def run_one_with_fallback(
         attempts = ticker_candidates(raw_ticker, cfg.default_suffix, fallback_suffixes)
 
     for t in attempts:
-        res = run_one(t, cfg=cfg, refresh=refresh)
+        # Use multi-horizon ensemble if enabled
+        if cfg.use_multi_horizon:
+            res = run_one_multi_horizon(t, cfg=cfg, refresh=refresh)
+        else:
+            res = run_one(t, cfg=cfg, refresh=refresh)
         if res is not None:
             return res
     return None
@@ -823,7 +1136,8 @@ def main() -> int:
         default=".BO",
         help="Comma-separated suffixes to try if the primary suffix fails (Yahoo: BSE is usually .BO).",
     )
-    ap.add_argument("--horizon-months", type=int, default=3, help="Forecast horizon in months (approx 21 trading days/month).")
+    ap.add_argument("--horizon-months", type=int, default=3, help="Forecast horizon in months (approx 21 trading days/month). Primary horizon for output; multi-horizon ensemble uses 1M/3M/6M.")
+    ap.add_argument("--no-multi-horizon", action="store_true", help="Disable multi-horizon ensemble (use single-horizon mode).")
     ap.add_argument("--refresh", action="store_true", help="Force refresh download (ignore cache).")
     ap.add_argument("--top", type=int, default=25, help="Show top N ranked results.")
     ap.add_argument("--export", default="", help="Optional path to export CSV results.")
@@ -836,7 +1150,11 @@ def main() -> int:
     ap.add_argument("--corr-lookback", type=int, default=252, help="Lookback days for correlation/portfolio risk estimate.")
     args = ap.parse_args()
 
-    cfg = Config(horizon_months=args.horizon_months, default_suffix=args.suffix)
+    cfg = Config(
+        horizon_months=args.horizon_months,
+        default_suffix=args.suffix,
+        use_multi_horizon=not args.no_multi_horizon,
+    )
     fallback_suffixes = [s.strip() for s in str(args.fallback_suffixes).split(",") if s.strip()]
 
     raw_tickers = read_tickers(args.tickers_file)
@@ -845,7 +1163,8 @@ def main() -> int:
     results: list[dict] = []
     skipped: list[str] = []
 
-    print(f"Quant-Lite | Horizon: {cfg.horizon_months} months (~{cfg.horizon_days} trading days)")
+    mode_str = "Multi-horizon ensemble (1M/3M/6M)" if cfg.use_multi_horizon else f"Single-horizon ({cfg.horizon_months}M)"
+    print(f"Quant-Lite | Mode: {mode_str} | Primary horizon: {cfg.horizon_months} months (~{cfg.horizon_days} trading days)")
     print(f"Tickers: {len(tickers)} | Cache: {cfg.cache_dir.resolve()}")
     print("-" * 110)
 
