@@ -18,7 +18,8 @@ from quant_lite import Config, run_one
 def get_forecast_cached(ticker: str, horizon_months: int, default_suffix: str, use_multi_horizon: bool = True) -> dict | None:
     """
     Cached wrapper around run_one/run_one_multi_horizon to avoid retraining on repeat queries.
-    Cache key includes (ticker, horizon_months, default_suffix, use_multi_horizon).
+    For multi-horizon mode, cache key only includes (ticker, default_suffix) since we always train 1M/3M/6M.
+    For single-horizon mode, cache key includes (ticker, horizon_months, default_suffix).
     """
     from quant_lite import run_one_multi_horizon
     
@@ -32,6 +33,25 @@ def get_forecast_cached(ticker: str, horizon_months: int, default_suffix: str, u
         return run_one_multi_horizon(ticker, cfg=cfg, refresh=False)
     else:
         return run_one(ticker, cfg=cfg, refresh=False)
+
+
+# Separate cache function for multi-horizon to avoid retraining when only horizon_months changes
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_forecast_multi_horizon_cached(ticker: str, default_suffix: str) -> dict | None:
+    """
+    Cached wrapper for multi-horizon ensemble.
+    Cache key is (ticker, default_suffix) - horizon_months doesn't affect training.
+    """
+    from quant_lite import run_one_multi_horizon
+    
+    # Use a fixed horizon_months since multi-horizon always trains 1M/3M/6M anyway
+    cfg = Config(
+        horizon_months=3,  # Doesn't matter - we train 1M/3M/6M regardless
+        default_suffix=default_suffix,
+        cache_dir=Path("data_cache"),
+        use_multi_horizon=True,
+    )
+    return run_one_multi_horizon(ticker, cfg=cfg, refresh=False)
 
 
 st.set_page_config(
@@ -103,18 +123,31 @@ with tab_forecast:
             raw = ticker_input.strip().upper()
             ticker = raw if raw.endswith((".NS", ".BO")) else f"{raw}{default_suffix}"
 
-            result = get_forecast_cached(ticker, horizon_months, default_suffix, use_multi_horizon=use_multi_horizon)
-
-            # Fallback if primary fails
-            if result is None and fallback_suffix:
-                if ticker.endswith(default_suffix):
-                    base = ticker[: -len(default_suffix)]
-                else:
-                    base = raw
-                alt = f"{base}{fallback_suffix}"
-                result = get_forecast_cached(alt, horizon_months, default_suffix="", use_multi_horizon=use_multi_horizon)
-                if result is not None:
-                    ticker = alt
+            # Use separate cache for multi-horizon to avoid retraining when horizon_months changes
+            if use_multi_horizon:
+                result = get_forecast_multi_horizon_cached(ticker, default_suffix)
+                # Fallback if primary fails
+                if result is None and fallback_suffix:
+                    if ticker.endswith(default_suffix):
+                        base = ticker[: -len(default_suffix)]
+                    else:
+                        base = raw
+                    alt = f"{base}{fallback_suffix}"
+                    result = get_forecast_multi_horizon_cached(alt, "")
+                    if result is not None:
+                        ticker = alt
+            else:
+                result = get_forecast_cached(ticker, horizon_months, default_suffix, use_multi_horizon=False)
+                # Fallback if primary fails
+                if result is None and fallback_suffix:
+                    if ticker.endswith(default_suffix):
+                        base = ticker[: -len(default_suffix)]
+                    else:
+                        base = raw
+                    alt = f"{base}{fallback_suffix}"
+                    result = get_forecast_cached(alt, horizon_months, default_suffix="", use_multi_horizon=False)
+                    if result is not None:
+                        ticker = alt
 
         if result is None:
             st.error(
