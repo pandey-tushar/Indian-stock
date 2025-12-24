@@ -672,22 +672,27 @@ def run_one_horizon(
 
 def run_one_multi_horizon(ticker: str, cfg: Config, refresh: bool = False) -> dict | None:
     """
-    Multi-horizon ensemble: train separate models for 1M, 3M, 6M and ensemble predictions.
-    Uses confidence-weighted averaging where confidence = 1 / (1 + uncertainty_band).
+    Multi-horizon: train separate models for 1M, 3M, 6M and return ALL predictions in a dict.
     Trains models in parallel for speed since they all use the same data.
+    Returns a dict with keys like "1M", "3M", "6M" containing predictions for each horizon.
     """
     df = load_cached_or_download(ticker, cfg=cfg, refresh=refresh, period="max")
     if df is None or len(df) < cfg.min_rows_short:
         return None
 
     # Determine which horizons to use based on available data
+    # Train multiple horizons to cover the slider range (1-12 months)
     horizons_to_use = []
     if len(df) >= 100:  # Need at least ~100 days for 1M
         horizons_to_use.append(1)
+    if len(df) >= 150:  # Need at least ~150 days for 2M
+        horizons_to_use.append(2)
     if len(df) >= 200:  # Need at least ~200 days for 3M
         horizons_to_use.append(3)
     if len(df) >= 400:  # Need at least ~400 days for 6M
         horizons_to_use.append(6)
+    if len(df) >= 800:  # Need at least ~800 days for 12M
+        horizons_to_use.append(12)
     
     # Fallback: if we can't use multiple horizons, use single horizon approach
     if not horizons_to_use:
@@ -695,10 +700,18 @@ def run_one_multi_horizon(ticker: str, cfg: Config, refresh: bool = False) -> di
     
     # If only one horizon is available, fall back to single-horizon mode
     if len(horizons_to_use) == 1:
-        return run_one(ticker, cfg, refresh)
+        single_result = run_one(ticker, cfg, refresh)
+        if single_result is None:
+            return None
+        # Wrap in dict format for consistency
+        h = horizons_to_use[0]
+        return {
+            "horizons": {f"{h}M": single_result},
+            "available_horizons": [h],
+        }
     
     # Train models in parallel since they all use the same dataframe
-    horizon_results = []
+    horizon_results = {}
     with ThreadPoolExecutor(max_workers=min(len(horizons_to_use), 3)) as executor:
         # Submit all horizon training tasks
         future_to_horizon = {
@@ -712,71 +725,45 @@ def run_one_multi_horizon(ticker: str, cfg: Config, refresh: bool = False) -> di
             try:
                 result = future.result()
                 if result is not None:
-                    horizon_results.append(result)
+                    # Convert horizon result to full result dict format
+                    h_days = result["horizon_days"]
+                    exp_ret_pct = pct_from_logret(result["pred_med_scaled"])
+                    
+                    # Get OOS metrics if available
+                    if len(df) >= cfg.min_rows_long:
+                        data = engineer_features(df, horizon_days=h_days)
+                        feature_cols = get_feature_cols_for_horizon(data, horizon_days=h_days, data_length=len(df))
+                        metrics = oos_sanity_metrics(data=data, feature_cols=feature_cols)
+                    else:
+                        metrics = {}
+                    
+                    horizon_results[f"{h_months}M"] = {
+                        "Stock": ticker,
+                        "Price": float(df["Close"].iloc[-1]),
+                        "Horizon_Days": h_days,
+                        "Horizon_Days_Used": int(result["horizon_days_used"]),
+                        "Model_Regime": result["model_regime"],
+                        "Data_Rows": int(len(df)),
+                        "P_Up": result["p_up"],
+                        "Forecast_Med_%": exp_ret_pct,
+                        "Forecast_P10_%": pct_from_logret(result["pred_p10_scaled"]),
+                        "Forecast_P90_%": pct_from_logret(result["pred_p90_scaled"]),
+                        "Uncertainty_Band_%": float(result["band_width"]),
+                        "Risk_Vol_%": result["vol_h"],
+                        "Edge_%": float(exp_ret_pct * (2.0 * result["p_up"] - 1.0)),
+                        "Risk_Adj_Score": float((exp_ret_pct * (2.0 * result["p_up"] - 1.0)) / (result["vol_h"] + EPS)),
+                        **metrics,
+                    }
             except Exception:
                 # If one horizon fails, continue with others
-                # The ensemble will work with whatever horizons succeeded
                 continue
     
     if not horizon_results:
         return None
     
-    # Ensemble: confidence-weighted average
-    # Weight by confidence (inverse of uncertainty band width)
-    total_weight = sum(r["confidence"] for r in horizon_results)
-    if total_weight <= EPS:
-        # Fallback to equal weights
-        weights = [1.0 / len(horizon_results)] * len(horizon_results)
-    else:
-        weights = [r["confidence"] / total_weight for r in horizon_results]
-    
-    # Weighted average of predictions
-    ens_pred_med = sum(r["pred_med_scaled"] * w for r, w in zip(horizon_results, weights))
-    ens_pred_p10 = sum(r["pred_p10_scaled"] * w for r, w in zip(horizon_results, weights))
-    ens_pred_p90 = sum(r["pred_p90_scaled"] * w for r, w in zip(horizon_results, weights))
-    ens_p_up = sum(r["p_up"] * w for r, w in zip(horizon_results, weights))
-    
-    # For risk, use the longest horizon's vol (most stable)
-    longest_horizon_result = max(horizon_results, key=lambda x: x["horizon_days"])
-    ens_vol_h = longest_horizon_result["vol_h"]
-    
-    # Ensemble uncertainty band
-    ens_band_width = pct_from_logret(ens_pred_p90) - pct_from_logret(ens_pred_p10)
-    
-    # Use the primary horizon (from cfg) for final output
-    primary_horizon_days = cfg.horizon_days
-    
-    # Risk-aware edge and score
-    exp_ret_pct = pct_from_logret(ens_pred_med)
-    signed_prob_edge = (2.0 * ens_p_up - 1.0)
-    edge_pct = exp_ret_pct * signed_prob_edge
-    score = edge_pct / (ens_vol_h + EPS)
-    
-    # Get OOS metrics from the longest horizon model (most reliable)
-    if len(df) >= cfg.min_rows_long:
-        data = engineer_features(df, horizon_days=longest_horizon_result["horizon_days"])
-        feature_cols = get_feature_cols_for_horizon(data, horizon_days=longest_horizon_result["horizon_days"], data_length=len(df))
-        metrics = oos_sanity_metrics(data=data, feature_cols=feature_cols)
-    else:
-        metrics = {}
-    
     return {
-        "Stock": ticker,
-        "Price": float(df["Close"].iloc[-1]),
-        "Horizon_Days": primary_horizon_days,
-        "Horizon_Days_Used": int(longest_horizon_result["horizon_days_used"]),
-        "Model_Regime": "multi_horizon_ensemble",
-        "Data_Rows": int(len(df)),
-        "P_Up": ens_p_up,
-        "Forecast_Med_%": exp_ret_pct,
-        "Forecast_P10_%": pct_from_logret(ens_pred_p10),
-        "Forecast_P90_%": pct_from_logret(ens_pred_p90),
-        "Uncertainty_Band_%": float(ens_band_width),
-        "Risk_Vol_%": ens_vol_h,
-        "Edge_%": float(edge_pct),
-        "Risk_Adj_Score": float(score),
-        "Ensemble_Horizons": ",".join(str(r["horizon_months"]) for r in horizon_results),
-        **metrics,
+        "horizons": horizon_results,
+        "available_horizons": sorted([int(k[:-1]) for k in horizon_results.keys()]),
     }
 
 

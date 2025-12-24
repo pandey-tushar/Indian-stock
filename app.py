@@ -11,7 +11,9 @@ from pathlib import Path
 import plotly.graph_objects as go
 import streamlit as st
 
-from quant_lite import Config, run_one
+from quant_lite import Config, run_one, load_cached_or_download
+import pandas as pd
+from datetime import datetime, timedelta
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -39,8 +41,8 @@ def get_forecast_cached(ticker: str, horizon_months: int, default_suffix: str, u
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_forecast_multi_horizon_cached(ticker: str, default_suffix: str) -> dict | None:
     """
-    Cached wrapper for multi-horizon ensemble.
-    Cache key is (ticker, default_suffix) - horizon_months doesn't affect training.
+    Cached wrapper for multi-horizon. Trains all horizons once and stores all predictions.
+    Cache key is (ticker, default_suffix) - returns dict with all horizon predictions.
     """
     from quant_lite import run_one_multi_horizon
     
@@ -125,17 +127,33 @@ with tab_forecast:
 
             # Use separate cache for multi-horizon to avoid retraining when horizon_months changes
             if use_multi_horizon:
-                result = get_forecast_multi_horizon_cached(ticker, default_suffix)
+                all_horizons_data = get_forecast_multi_horizon_cached(ticker, default_suffix)
                 # Fallback if primary fails
-                if result is None and fallback_suffix:
+                if all_horizons_data is None and fallback_suffix:
                     if ticker.endswith(default_suffix):
                         base = ticker[: -len(default_suffix)]
                     else:
                         base = raw
                     alt = f"{base}{fallback_suffix}"
-                    result = get_forecast_multi_horizon_cached(alt, "")
-                    if result is not None:
+                    all_horizons_data = get_forecast_multi_horizon_cached(alt, "")
+                    if all_horizons_data is not None:
                         ticker = alt
+                
+                # Extract the prediction for the selected horizon
+                if all_horizons_data and "horizons" in all_horizons_data:
+                    horizon_key = f"{horizon_months}M"
+                    # Find closest available horizon if exact match not found
+                    if horizon_key not in all_horizons_data["horizons"]:
+                        available = all_horizons_data.get("available_horizons", [])
+                        if available:
+                            # Use closest available horizon (prefer longer if equidistant)
+                            # Sort by distance, then by value (desc) to prefer longer horizons when tied
+                            closest = min(available, key=lambda x: (abs(x - horizon_months), -x))
+                            horizon_key = f"{closest}M"
+                    
+                    result = all_horizons_data["horizons"].get(horizon_key)
+                else:
+                    result = None
             else:
                 result = get_forecast_cached(ticker, horizon_months, default_suffix, use_multi_horizon=False)
                 # Fallback if primary fails
@@ -167,38 +185,150 @@ with tab_forecast:
             m2.metric("Trend probability (P_Up)", f"{p_up:.1f}%")
             m3.metric(f"Risk (realized vol, {horizon_months}M)", f"{vol:.2f}%")
 
+            # Get historical price data (1 year max)
+            current_price = float(result["Price"])
+            cfg = Config(cache_dir=Path("data_cache"))
+            hist_df = load_cached_or_download(ticker, cfg=cfg, refresh=False, period="1y")
+            
             fig = go.Figure()
+            
+            # Initialize last_date and last_price
+            last_date = datetime.now()
+            last_price = current_price
+            has_historical = False
+            
+            if hist_df is not None and not hist_df.empty and "Close" in hist_df.columns:
+                try:
+                    # Plot historical prices (last 1 year)
+                    hist_df = hist_df.sort_index()
+                    hist_dates = hist_df.index
+                    hist_prices = hist_df["Close"].values
+                    
+                    # Ensure we have valid data
+                    if len(hist_dates) > 0 and len(hist_prices) > 0:
+                        # Add historical price line
+                        fig.add_trace(
+                            go.Scatter(
+                                x=hist_dates,
+                                y=hist_prices,
+                                mode="lines",
+                                name="Historical Price",
+                                line=dict(color="#667eea", width=2),
+                                hovertemplate="Date: %{x|%Y-%m-%d}<br>Price: ₹%{y:.2f}<extra></extra>",
+                            )
+                        )
+                        
+                        # Get the last date and price
+                        last_date_val = hist_dates[-1]
+                        if isinstance(last_date_val, pd.Timestamp):
+                            last_date = last_date_val.to_pydatetime()
+                        elif isinstance(last_date_val, datetime):
+                            last_date = last_date_val
+                        else:
+                            last_date = pd.to_datetime(last_date_val).to_pydatetime()
+                        last_price = float(hist_prices[-1])
+                        has_historical = True
+                except Exception:
+                    # If anything fails, fall back to current price
+                    has_historical = False
+            
+            # If no historical data, show current price point
+            if not has_historical:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[last_date],
+                        y=[last_price],
+                        mode="markers",
+                        name="Current Price",
+                        marker=dict(color="#667eea", size=10),
+                        hovertemplate="Price: ₹%{y:.2f}<extra></extra>",
+                    )
+                )
+            
+            # Calculate forecast dates (extend into future)
+            horizon_days = horizon_months * 21  # Approximate trading days
+            forecast_end_date = last_date + timedelta(days=horizon_days * 7 / 5)  # Convert trading days to calendar days
+            
+            # Calculate forecast prices from percentages
+            price_p10 = last_price * (1 + p10 / 100.0)
+            price_med = last_price * (1 + forecast_med / 100.0)
+            price_p90 = last_price * (1 + p90 / 100.0)
+            
+            # Forecast band (P10-P90)
+            forecast_dates = [last_date, forecast_end_date, forecast_end_date, last_date, last_date]
+            forecast_prices_band = [last_price, price_p10, price_p90, price_p90, price_p10]
+            
             fig.add_trace(
                 go.Scatter(
-                    x=[p10, p90, p90, p10, p10],
-                    y=[0.35, 0.35, 0.65, 0.65, 0.35],
+                    x=forecast_dates,
+                    y=forecast_prices_band,
                     fill="toself",
-                    fillcolor="rgba(102, 126, 234, 0.18)",
+                    fillcolor="rgba(102, 126, 234, 0.15)",
                     line=dict(color="rgba(255,255,255,0)"),
                     hoverinfo="skip",
                     showlegend=False,
+                    name="Forecast Band (P10-P90)",
+                )
+            )
+            
+            # Forecast median line
+            fig.add_trace(
+                go.Scatter(
+                    x=[last_date, forecast_end_date],
+                    y=[last_price, price_med],
+                    mode="lines+markers",
+                    name=f"Forecast Median ({forecast_med:+.1f}%)",
+                    line=dict(color="#667eea", width=3, dash="dash"),
+                    marker=dict(size=[8, 12], color=["#667eea", "#10b981"]),
+                    hovertemplate="Date: %{x|%Y-%m-%d}<br>Price: ₹%{y:.2f}<extra></extra>",
+                )
+            )
+            
+            # P10 and P90 lines
+            fig.add_trace(
+                go.Scatter(
+                    x=[last_date, forecast_end_date],
+                    y=[last_price, price_p10],
+                    mode="lines",
+                    name=f"P10 ({p10:+.1f}%)",
+                    line=dict(color="#ef4444", width=2, dash="dot"),
+                    opacity=0.7,
+                    hovertemplate="Date: %{x|%Y-%m-%d}<br>Price: ₹%{y:.2f}<extra></extra>",
                 )
             )
             fig.add_trace(
                 go.Scatter(
-                    x=[p10, forecast_med, p90],
-                    y=[0.5, 0.5, 0.5],
-                    mode="markers+lines",
-                    marker=dict(size=[14, 18, 14], color=["#ef4444", "#667eea", "#10b981"], line=dict(width=2, color="white")),
-                    line=dict(color="#667eea", width=3),
-                    hovertext=[f"P10: {p10:.2f}%", f"Median: {forecast_med:.2f}%", f"P90: {p90:.2f}%"],
-                    hoverinfo="text",
-                    showlegend=False,
+                    x=[last_date, forecast_end_date],
+                    y=[last_price, price_p90],
+                    mode="lines",
+                    name=f"P90 ({p90:+.1f}%)",
+                    line=dict(color="#10b981", width=2, dash="dot"),
+                    opacity=0.7,
+                    hovertemplate="Date: %{x|%Y-%m-%d}<br>Price: ₹%{y:.2f}<extra></extra>",
                 )
             )
-            fig.add_vline(x=0, line_width=2, line_dash="dash", line_color="#999", opacity=0.6)
+            
+            # Vertical line separating historical from forecast
+            fig.add_vline(
+                x=last_date,
+                line_width=2,
+                line_dash="dash",
+                line_color="#999",
+                opacity=0.5,
+                annotation_text="Today",
+                annotation_position="top",
+            )
+            
             fig.update_layout(
-                title=f"{ticker} — {horizon_months}M return forecast (P10–P90 band)",
-                xaxis_title="Return (%)",
-                yaxis_visible=False,
-                height=320,
+                title=f"{ticker} — Price History & {horizon_months}M Forecast",
+                xaxis_title="Date",
+                yaxis_title="Price (₹)",
+                height=500,
                 plot_bgcolor="white",
+                hovermode="x unified",
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
                 xaxis=dict(gridcolor="#f0f0f0"),
+                yaxis=dict(gridcolor="#f0f0f0"),
             )
             st.plotly_chart(fig, use_container_width=True)
 
