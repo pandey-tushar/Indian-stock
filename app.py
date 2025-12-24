@@ -309,14 +309,27 @@ with tab_forecast:
             )
             
             # Vertical line separating historical from forecast
-            fig.add_vline(
-                x=last_date,
-                line_width=2,
-                line_dash="dash",
-                line_color="#999",
+            # Use add_shape instead of add_vline for datetime support
+            fig.add_shape(
+                type="line",
+                x0=last_date,
+                x1=last_date,
+                y0=0,
+                y1=1,
+                yref="paper",
+                line=dict(color="#999", width=2, dash="dash"),
                 opacity=0.5,
-                annotation_text="Today",
-                annotation_position="top",
+            )
+            fig.add_annotation(
+                x=last_date,
+                y=1,
+                yref="paper",
+                text="Today",
+                showarrow=False,
+                xanchor="left",
+                bgcolor="rgba(255,255,255,0.8)",
+                bordercolor="#999",
+                borderwidth=1,
             )
             
             fig.update_layout(
