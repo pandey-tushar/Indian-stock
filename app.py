@@ -10,7 +10,7 @@ st.set_page_config(
     page_title="StockForecast Pro | AI-Powered Stock Predictions",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # Professional CSS (applied globally)
@@ -41,6 +41,21 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# Explicit sidebar navigation (so it's always obvious)
+with st.sidebar:
+    st.markdown("## StockForecast Pro")
+    st.caption("AI-powered return forecasts with uncertainty bands")
+    st.markdown("---")
+    try:
+        st.page_link("pages/1_🏠_Home.py", label="Home", icon="🏠")
+        st.page_link("pages/2_📊_About_Model.py", label="About the Model", icon="📊")
+    except Exception:
+        # Fallback if Streamlit version lacks page_link (shouldn't happen on >=1.52)
+        st.markdown("- **Home**: select `🏠 Home` from the Pages menu")
+        st.markdown("- **About**: select `📊 About Model` from the Pages menu")
+    st.markdown("---")
+    st.caption("Not financial advice.")
 
 # Main landing content (if user lands on app.py directly, redirect to home)
 st.title("📈 StockForecast Pro")
